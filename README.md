@@ -1,14 +1,20 @@
 # Common Foundry AMD HIP Miner
 
-Native AMD (ROCm/HIP) replay worker for Common Foundry Mainnet `v1.0.13`
-pool mining. Open source under the MIT license. **No dev fee.**
+Native AMD (ROCm/HIP) replay worker for Common Foundry Mainnet pool mining.
+Open source under the MIT license. **No dev fee.**
+
+AMD miner releases use the same version number as the Common Foundry release
+they are for. `v1.0.15` works with the official `cmfd-miner` `1.0.13`,
+`1.0.14` and `1.0.15` (its code is unchanged across those releases). From
+`1.0.16` the AMD miner ships with the official Common Foundry release.
 
 Written by **Qcvibes1**, commissioned by the Common Foundry project.
 
 ## What it is
 
 - A HIP/rocBLAS replacement for the CUDA replay/search worker used by the
-  official `v1.0.13` `cmfd-miner` pool coordinator.
+  official `cmfd-miner` pool coordinator (built and qualified against
+  `v1.0.13`).
 - The official coordinator still handles the pool connection, shares, target
   checks and your payout address. This worker only computes batches; it has no
   network code.
@@ -23,9 +29,11 @@ Written by **Qcvibes1**, commissioned by the Common Foundry project.
 
 ## Download
 
-Get `common-foundry-amd-hip-v1.0.13-linux-x86_64.tar.gz` from
-[Releases](../../releases). You also need the official `v1.0.13` `cmfd-miner`
-and `MODEL-V2.bank` from the Common Foundry release.
+Get `common-foundry-amd-hip-v<version>-linux-x86_64.tar.gz` from
+[Releases](../../releases): `v1.0.13` is Qcvibes1's original qualified
+package; `v1.0.15` (prerelease) adds WSL2 support and the mining screen. You
+also need the official `cmfd-miner` (`1.0.13`–`1.0.15`) and `MODEL-V2.bank`
+from the Common Foundry release.
 
 ```bash
 CMFD_MINER_BINARY=/path/to/cmfd-miner \

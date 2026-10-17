@@ -40,9 +40,10 @@ tar -xzf <package>.tar.gz
 (about 2.3 GB, asks first), checks that HIP sees the GPU and runs the exact
 GPU self-test.
 
-You also need the official Common Foundry `v1.0.13` Linux miner
-(`commonfoundry-mainnet-miner-linux-x86_64-v1.0.13.tar.gz` from the
-Common Foundry release) and its `MODEL-V2.bank`. Keep both inside the WSL
+You also need the official Common Foundry Linux miner
+(`commonfoundry-mainnet-miner-linux-x86_64-v1.0.15.tar.gz` from the
+Common Foundry v1.0.15 release; 1.0.13 and 1.0.14 also work) and its
+`MODEL-V2.bank`. Keep both inside the WSL
 filesystem (for example `~/cmfd`), not under `/mnt/c`, so the 6.4 GB model
 loads quickly.
 
