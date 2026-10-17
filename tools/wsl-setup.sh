@@ -24,12 +24,19 @@ else
   telemetry="${script_dir}/amd_gpu_telemetry.py"
 fi
 
-rocdxg_version=1.2.1
+# 1.2.1 is AMD's librocdxg release for ROCm 7.14; it exports every symbol the
+# ROCm 7.14 runtime requires.  CMFD_ROCDXG_VERSION=1.2.2 selects the newer pin.
+rocdxg_version="${CMFD_ROCDXG_VERSION:-1.2.1}"
+case "${rocdxg_version}" in
+  1.2.1) packages=(
+    "rocdxg-roct_1.2.1_amd64.deb 184644 7889eef45a1132ed2dde88d8ea1356bf791ec9c05802a18940bc81b970e850e0"
+    "rocdxg-amd-smi-lib_1.2.1_amd64.deb 547942 6ea9872bfd2a8531b930efd307d13e5ca38a7c362d0b66fe2f37addbf95554d2") ;;
+  1.2.2) packages=(
+    "rocdxg-roct_1.2.2_amd64.deb 185130 28ded1254811192ebace1f76c0227580184af7b27ab2475fb9728295a702d541"
+    "rocdxg-amd-smi-lib_1.2.2_amd64.deb 548282 f9b601457ea513a223c7dd2cc281fb0aef1d11f21f38ce6108dc76e665ad6cc5") ;;
+  *) printf 'ERROR: CMFD_ROCDXG_VERSION must be 1.2.1 or 1.2.2\n' >&2; exit 2 ;;
+esac
 rocdxg_url="https://github.com/ROCm/librocdxg/releases/download/v${rocdxg_version}"
-packages=(
-  "rocdxg-roct_${rocdxg_version}_amd64.deb 184644 7889eef45a1132ed2dde88d8ea1356bf791ec9c05802a18940bc81b970e850e0"
-  "rocdxg-amd-smi-lib_${rocdxg_version}_amd64.deb 547942 6ea9872bfd2a8531b930efd307d13e5ca38a7c362d0b66fe2f37addbf95554d2"
-)
 
 say() { printf '\n==> %s\n' "$*"; }
 fail() { printf '\nERROR: %s\n' "$*" >&2; exit 1; }

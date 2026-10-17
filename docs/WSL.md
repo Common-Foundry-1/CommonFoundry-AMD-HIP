@@ -88,6 +88,10 @@ Please report:
 
 Most likely WSL-specific problems, so we know what to look for:
 
+- **HIP finds no GPU** at "Checking that HIP sees the GPU": ROCm did not load
+  AMD's bridge. Please add the output of `ldconfig -p | grep librocdxg` and
+  `ls -l /opt/rocm/lib`. To try AMD's newer bridge release, run
+  `CMFD_ROCDXG_VERSION=1.2.2 wsl-setup.sh`.
 - **Pinned host memory** (`hipHostMalloc`) or **HIP Graphs** failing under
   WSL; the worker reports `CMFD_HIP_ERROR` with the failing call.
 - **Not enough free VRAM** because Windows keeps part of it.
