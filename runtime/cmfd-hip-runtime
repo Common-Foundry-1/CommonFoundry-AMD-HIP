@@ -1,0 +1,542 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+default_catalog="${script_dir}/packages-v1.tsv"
+if [[ ! -r "${default_catalog}" ]]; then
+  default_catalog="${script_dir}/../share/common-foundry/amd-hip/packages-v1.tsv"
+fi
+catalog="${CMFD_HIP_PACKAGE_CATALOG:-${default_catalog}}"
+if [[ -n "${CMFD_HIP_STATE_DIR:-}" ]]; then
+  state_dir="${CMFD_HIP_STATE_DIR}"
+elif [[ -n "${XDG_DATA_HOME:-}" ]]; then
+  state_dir="${XDG_DATA_HOME}/common-foundry/amd-hip"
+else
+  state_dir="${HOME}/.local/share/common-foundry/amd-hip"
+fi
+active_manifest="${state_dir}/active.manifest"
+schema='common-foundry.amd-hip.runtime-manager'
+
+json_escape() {
+  local value=${1-}
+  value=${value//\/\\}
+  value=${value//\"/\\\"}
+  value=${value//$'\n'/\\n}
+  value=${value//$'\r'/\\r}
+  value=${value//$'\t'/\\t}
+  printf '%s' "${value}"
+}
+
+emit_error() {
+  local code=$1 message=$2 exit_code=${3:-1}
+  printf '{"schema":"%s","schema_version":1,"status":"error","error":{"code":"%s","message":"%s"}}\n' \
+    "${schema}" "$(json_escape "${code}")" "$(json_escape "${message}")"
+  exit "${exit_code}"
+}
+
+emit_progress() {
+  printf '{"schema":"%s","schema_version":1,"event":"%s","message":"%s"}\n' \
+    "${schema}" "$(json_escape "$1")" "$(json_escape "$2")" >&2
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || emit_error dependency_missing "Required command is unavailable: $1" 20
+}
+
+ensure_private_directory() {
+  local directory=$1
+  mkdir -p -- "${directory}" 2>/dev/null \
+    || emit_error state_not_writable "Cannot create private runtime directory: ${directory}" 40
+  chmod 700 -- "${directory}" 2>/dev/null \
+    || emit_error state_not_writable "Cannot secure private runtime directory: ${directory}" 40
+  [[ -d "${directory}" && -w "${directory}" ]] \
+    || emit_error state_not_writable "Private runtime directory is not writable: ${directory}" 40
+}
+
+csv_contains() {
+  local csv=$1 wanted=$2 item
+  IFS=',' read -r -a items <<<"${csv}"
+  for item in "${items[@]}"; do
+    [[ "${item}" == "${wanted}" ]] && return 0
+  done
+  return 1
+}
+
+read_manifest_value() {
+  local key=$1 path=$2 line
+  [[ -r "${path}" ]] || return 1
+  while IFS= read -r line; do
+    [[ "${line}" == "${key}="* ]] || continue
+    printf '%s\n' "${line#*=}"
+    return 0
+  done <"${path}"
+  return 1
+}
+
+find_runtime_library() {
+  local directory=$1 unversioned=$2 prefix=$3 candidate
+  if [[ -e "${directory}/${unversioned}" ]]; then
+    realpath -e -- "${directory}/${unversioned}"
+    return 0
+  fi
+  while IFS= read -r candidate; do
+    [[ -n "${candidate}" ]] || continue
+    realpath -e -- "${candidate}"
+    return 0
+  done < <(find "${directory}" -maxdepth 1 -type f -name "${prefix}*" -print 2>/dev/null | sort -r)
+  return 1
+}
+
+probe_runtime() {
+  local requested_root=$1
+  runtime_ready=false
+  runtime_root="${requested_root}"
+  runtime_version=''
+  runtime_hip=''
+  runtime_rocblas=''
+  runtime_rocblas_dir=''
+  runtime_architectures=''
+  runtime_error=''
+
+  [[ "${requested_root}" == /* ]] || {
+    runtime_error='runtime root is not absolute'
+    return 1
+  }
+  runtime_root="$(realpath -m -- "${requested_root}")"
+  [[ -d "${runtime_root}/lib" ]] || {
+    runtime_error="runtime library directory is missing: ${runtime_root}/lib"
+    return 1
+  }
+  runtime_hip="$(find_runtime_library "${runtime_root}/lib" libamdhip64.so libamdhip64.so. 2>/dev/null || true)"
+  runtime_rocblas="$(find_runtime_library "${runtime_root}/lib" librocblas.so librocblas.so. 2>/dev/null || true)"
+  runtime_rocblas_dir="${runtime_root}/lib/rocblas/library"
+  [[ -n "${runtime_hip}" ]] || {
+    runtime_error="libamdhip64 is missing from ${runtime_root}/lib"
+    return 1
+  }
+  [[ -n "${runtime_rocblas}" ]] || {
+    runtime_error="librocblas is missing from ${runtime_root}/lib"
+    return 1
+  }
+  [[ -d "${runtime_rocblas_dir}" ]] || {
+    runtime_error="rocBLAS architecture directory is missing: ${runtime_rocblas_dir}"
+    return 1
+  }
+  runtime_architectures="$(find "${runtime_rocblas_dir}" -maxdepth 1 -type f -printf '%f\n' 2>/dev/null \
+    | grep -oE 'gfx[0-9a-f]+' | sort -u | paste -sd, - || true)"
+  [[ -n "${runtime_architectures}" ]] || {
+    runtime_error="rocBLAS contains no architecture code objects in ${runtime_rocblas_dir}"
+    return 1
+  }
+  if [[ -r "${runtime_root}/.info/version" ]]; then
+    IFS= read -r runtime_version <"${runtime_root}/.info/version" || true
+  elif [[ -r "${runtime_root}/share/hip/version" ]]; then
+    runtime_version="$(awk -F= '$1=="HIP_VERSION_MAJOR" {major=$2} $1=="HIP_VERSION_MINOR" {minor=$2} END {if (major!="" && minor!="") print major "." minor}' "${runtime_root}/share/hip/version")"
+  fi
+  runtime_version=${runtime_version:-unknown}
+  [[ "${runtime_version}" == 7.14 || "${runtime_version}" == 7.14.* ]] || {
+    runtime_error="ROCm runtime ${runtime_version} is incompatible; this worker requires the 7.14 ABI family"
+    return 1
+  }
+  runtime_ready=true
+  return 0
+}
+
+locate_runtime() {
+  runtime_source='none'
+  if [[ -n "${CMFD_HIP_RUNTIME_ROOT:-}" ]]; then
+    runtime_source='environment'
+    probe_runtime "${CMFD_HIP_RUNTIME_ROOT}"
+    return
+  fi
+  local manifest=${CMFD_HIP_RUNTIME_MANIFEST:-${active_manifest}} manifest_root
+  if [[ -e "${manifest}" ]]; then
+    runtime_source='manifest'
+    [[ "$(read_manifest_value schema "${manifest}" || true)" == 'common-foundry.amd-hip.runtime-v1' ]] || {
+      runtime_error="runtime manifest has an unsupported schema: ${manifest}"
+      runtime_ready=false
+      return 1
+    }
+    [[ "$(read_manifest_value complete "${manifest}" || true)" == 1 ]] || {
+      runtime_error="runtime manifest is incomplete: ${manifest}"
+      runtime_ready=false
+      return 1
+    }
+    manifest_root="$(read_manifest_value runtime_root "${manifest}" || true)"
+    probe_runtime "${manifest_root}"
+    return
+  fi
+  if [[ -n "${CMFD_HIP_RUNTIME_MANIFEST:-}" ]]; then
+    runtime_error="explicit runtime manifest does not exist: ${manifest}"
+    runtime_ready=false
+    return 1
+  fi
+
+  local candidate
+  for candidate in /opt/rocm /opt/rocm/core-* /opt/rocm-*; do
+    [[ -d "${candidate}" ]] || continue
+    if probe_runtime "${candidate}"; then
+      runtime_source='system'
+      return 0
+    fi
+  done
+  runtime_ready=false
+  runtime_source='none'
+  runtime_error='no coherent ROCm runtime was found'
+  return 1
+}
+
+prehip_devices_json() {
+  local first=true device vendor class device_id driver driver_link
+  printf '['
+  for device in /sys/bus/pci/devices/*; do
+    [[ -d "${device}" && -r "${device}/vendor" && -r "${device}/class" ]] || continue
+    IFS= read -r vendor <"${device}/vendor" || continue
+    IFS= read -r class <"${device}/class" || continue
+    [[ "${vendor,,}" == 0x1002 && "${class,,}" == 0x03* ]] || continue
+    device_id='unknown'
+    [[ -r "${device}/device" ]] && IFS= read -r device_id <"${device}/device"
+    driver='none'
+    if [[ -L "${device}/driver" ]]; then
+      driver_link="$(readlink -- "${device}/driver" || true)"
+      driver=${driver_link##*/}
+    fi
+    [[ "${first}" == true ]] || printf ','
+    first=false
+    printf '{"pci_bus_id":"%s","vendor_id":"%s","device_id":"%s","class":"%s","kernel_driver":"%s","architecture":null}' \
+      "$(json_escape "${device##*/}")" "$(json_escape "${vendor}")" \
+      "$(json_escape "${device_id}")" "$(json_escape "${class}")" "$(json_escape "${driver}")"
+  done
+  printf ']'
+}
+
+device_access_state() {
+  local path=$1
+  if [[ ! -e "${path}" ]]; then printf missing
+  elif [[ -r "${path}" && -w "${path}" ]]; then printf accessible
+  else printf permission_denied
+  fi
+}
+
+emit_status() {
+  local os_id=unknown os_version=unknown kfd dri amd_devices
+  if [[ -r /etc/os-release ]]; then
+    os_id="$(awk -F= '$1=="ID" {gsub(/"/,"",$2); print $2; exit}' /etc/os-release)"
+    os_version="$(awk -F= '$1=="VERSION_ID" {gsub(/"/,"",$2); print $2; exit}' /etc/os-release)"
+  fi
+  kfd="$(device_access_state /dev/kfd)"
+  dri=missing
+  for path in /dev/dri/render*; do
+    [[ -e "${path}" ]] || continue
+    dri="$(device_access_state "${path}")"
+    [[ "${dri}" == accessible ]] && break
+  done
+  amd_devices="$(prehip_devices_json)"
+  if locate_runtime; then :; else :; fi
+  printf '{"schema":"%s","schema_version":1,"status":"%s","runtime":{"ready":%s,"source":"%s","root":"%s","version":"%s","architectures":[' \
+    "${schema}" "$([[ "${runtime_ready}" == true ]] && printf ready || printf needs_preparation)" \
+    "${runtime_ready}" "$(json_escape "${runtime_source}")" "$(json_escape "${runtime_root:-}")" \
+    "$(json_escape "${runtime_version:-}")"
+  local first=true architecture
+  IFS=',' read -r -a architectures <<<"${runtime_architectures:-}"
+  for architecture in "${architectures[@]}"; do
+    [[ -n "${architecture}" ]] || continue
+    [[ "${first}" == true ]] || printf ','
+    first=false
+    printf '"%s"' "$(json_escape "${architecture}")"
+  done
+  printf '],"error":'
+  if [[ -n "${runtime_error:-}" ]]; then printf '"%s"' "$(json_escape "${runtime_error}")"; else printf null; fi
+  printf '},"system":{"os_id":"%s","os_version":"%s","kernel":"%s","kfd":"%s","dri_render":"%s","amd_pci_devices":%s},"network_required":%s,"authorization_required":%s,"error":null}\n' \
+    "$(json_escape "${os_id}")" "$(json_escape "${os_version}")" "$(json_escape "$(uname -r)")" \
+    "${kfd}" "${dri}" "${amd_devices}" \
+    "$([[ "${runtime_ready}" == true ]] && printf false || printf true)" \
+    "$([[ "${runtime_ready}" == true ]] && printf false || printf true)"
+}
+
+rocblas_inventory_fingerprint() {
+  find "${runtime_rocblas_dir}" -maxdepth 1 -type f -printf '%f\t%s\t%T@\n' 2>/dev/null \
+    | sort | sha256sum | awk '{print $1}'
+}
+
+write_active_manifest() {
+  local source=$1 archive_sha=${2:--} architecture=${3:-auto}
+  ensure_private_directory "${state_dir}"
+  local temporary="${state_dir}/active.manifest.tmp.$$"
+  local hip_rel rocblas_rel hip_size rocblas_size hip_mtime rocblas_mtime
+  hip_rel="$(realpath --relative-to="${runtime_root}" -- "${runtime_hip}")"
+  rocblas_rel="$(realpath --relative-to="${runtime_root}" -- "${runtime_rocblas}")"
+  hip_size="$(stat -Lc '%s' -- "${runtime_hip}")"
+  rocblas_size="$(stat -Lc '%s' -- "${runtime_rocblas}")"
+  hip_mtime="$(stat -Lc '%Y' -- "${runtime_hip}")"
+  rocblas_mtime="$(stat -Lc '%Y' -- "${runtime_rocblas}")"
+  {
+    printf 'schema=common-foundry.amd-hip.runtime-v1\n'
+    printf 'complete=1\n'
+    printf 'runtime_root=%s\n' "${runtime_root}"
+    printf 'runtime_version=%s\n' "${runtime_version}"
+    printf 'source=%s\n' "${source}"
+    printf 'architecture=%s\n' "${architecture}"
+    printf 'rocblas_architectures=%s\n' "${runtime_architectures}"
+    printf 'archive_sha256=%s\n' "${archive_sha}"
+    printf 'hip_library=%s\n' "${hip_rel}"
+    printf 'hip_size=%s\n' "${hip_size}"
+    printf 'hip_mtime=%s\n' "${hip_mtime}"
+    printf 'hip_sha256=%s\n' "$(sha256sum -- "${runtime_hip}" | awk '{print $1}')"
+    printf 'rocblas_library=%s\n' "${rocblas_rel}"
+    printf 'rocblas_size=%s\n' "${rocblas_size}"
+    printf 'rocblas_mtime=%s\n' "${rocblas_mtime}"
+    printf 'rocblas_sha256=%s\n' "$(sha256sum -- "${runtime_rocblas}" | awk '{print $1}')"
+    printf 'rocblas_inventory_sha256=%s\n' "$(rocblas_inventory_fingerprint)"
+  } >"${temporary}"
+  chmod 600 -- "${temporary}"
+  if [[ -f "${active_manifest}" ]]; then
+    cp -- "${active_manifest}" "${state_dir}/previous.manifest"
+    chmod 600 -- "${state_dir}/previous.manifest"
+  fi
+  mv -f -- "${temporary}" "${active_manifest}"
+}
+
+adopt_runtime() {
+  local root=$1 source=${2:-adopted} archive_sha=${3:--} architecture=${4:-auto}
+  probe_runtime "${root}" || emit_error runtime_incomplete "${runtime_error}" 21
+  write_active_manifest "${source}" "${archive_sha}" "${architecture}"
+  printf '{"schema":"%s","schema_version":1,"status":"ready","reused":false,"runtime_root":"%s","runtime_version":"%s","architectures":"%s","error":null}\n' \
+    "${schema}" "$(json_escape "${runtime_root}")" "$(json_escape "${runtime_version}")" \
+    "$(json_escape "${runtime_architectures}")"
+}
+
+verify_active() {
+  local deep=${1:-false} root hip_rel rocblas_rel current expected
+  [[ -r "${active_manifest}" ]] || emit_error runtime_manifest_missing 'No active private runtime manifest exists' 22
+  root="$(read_manifest_value runtime_root "${active_manifest}" || true)"
+  probe_runtime "${root}" || emit_error runtime_incomplete "${runtime_error}" 21
+  hip_rel="$(read_manifest_value hip_library "${active_manifest}" || true)"
+  rocblas_rel="$(read_manifest_value rocblas_library "${active_manifest}" || true)"
+  [[ "$(stat -Lc '%s' -- "${runtime_root}/${hip_rel}")" == "$(read_manifest_value hip_size "${active_manifest}" || true)" \
+     && "$(stat -Lc '%Y' -- "${runtime_root}/${hip_rel}")" == "$(read_manifest_value hip_mtime "${active_manifest}" || true)" \
+     && "$(stat -Lc '%s' -- "${runtime_root}/${rocblas_rel}")" == "$(read_manifest_value rocblas_size "${active_manifest}" || true)" \
+     && "$(stat -Lc '%Y' -- "${runtime_root}/${rocblas_rel}")" == "$(read_manifest_value rocblas_mtime "${active_manifest}" || true)" ]] \
+    || emit_error runtime_changed 'Critical runtime library metadata changed; deep verification is required' 23
+  current="$(rocblas_inventory_fingerprint)"
+  expected="$(read_manifest_value rocblas_inventory_sha256 "${active_manifest}" || true)"
+  [[ "${current}" == "${expected}" ]] || emit_error runtime_changed 'rocBLAS architecture inventory changed' 23
+  if [[ "${deep}" == true ]]; then
+    [[ "$(sha256sum -- "${runtime_root}/${hip_rel}" | awk '{print $1}')" == "$(read_manifest_value hip_sha256 "${active_manifest}" || true)" ]] \
+      || emit_error runtime_corrupt 'libamdhip64 SHA-256 mismatch' 24
+    [[ "$(sha256sum -- "${runtime_root}/${rocblas_rel}" | awk '{print $1}')" == "$(read_manifest_value rocblas_sha256 "${active_manifest}" || true)" ]] \
+      || emit_error runtime_corrupt 'librocblas SHA-256 mismatch' 24
+  fi
+  printf '{"schema":"%s","schema_version":1,"status":"ready","verification":"%s","runtime_root":"%s","error":null}\n' \
+    "${schema}" "$([[ "${deep}" == true ]] && printf deep || printf quick)" "$(json_escape "${runtime_root}")"
+}
+
+catalog_entry() {
+  local wanted=$1 format family arches version url length object
+  [[ -r "${catalog}" ]] || emit_error catalog_missing "Runtime package catalog is missing: ${catalog}" 25
+  while IFS=$'\t' read -r format family arches version url length object; do
+    [[ -n "${format}" && "${format}" != \#* ]] || continue
+    if [[ "${wanted}" == auto && "${format}" == runfile ]] || csv_contains "${arches}" "${wanted}"; then
+      package_format=${format}; package_family=${family}; package_arches=${arches}
+      package_version=${version}; package_url=${url}; package_length=${length}
+      package_object=${object}
+      return 0
+    fi
+  done <"${catalog}"
+  return 1
+}
+
+safe_cleanup() {
+  local target=${1:-}
+  [[ -n "${target}" && "${target}" == "${state_dir}/staging."* ]] || return 0
+  rm -rf -- "${target}"
+}
+
+find_extracted_runtime() {
+  local staging=$1 candidate
+  if [[ -d "${staging}/lib" ]]; then printf '%s\n' "${staging}"; return 0; fi
+  while IFS= read -r candidate; do
+    [[ -n "${candidate}" ]] || continue
+    printf '%s\n' "${candidate%/lib}"
+    return 0
+  done < <(find "${staging}" -mindepth 2 -maxdepth 5 -type d -name lib -print 2>/dev/null | sort)
+  return 1
+}
+
+install_bundle() {
+  local bundle=$1 expected_sha=$2 format=$3 architecture=$4 source=$5
+  local actual_sha size available staging extracted install_dir identifier
+  [[ -r "${bundle}" ]] || emit_error bundle_missing "Runtime bundle is unreadable: ${bundle}" 26
+  actual_sha="$(sha256sum -- "${bundle}" | awk '{print $1}')"
+  if [[ -n "${expected_sha}" && "${expected_sha}" != - && "${actual_sha}" != "${expected_sha,,}" ]]; then
+    emit_error bundle_corrupt 'Runtime bundle SHA-256 mismatch' 27
+  fi
+  size="$(stat -Lc '%s' -- "${bundle}")"
+  available="$(df -PB1 -- "${state_dir}" | awk 'NR==2 {print $4}')"
+  (( available >= size * 3 )) || emit_error insufficient_disk_space 'Insufficient free space for atomic runtime extraction' 28
+  staging="${state_dir}/staging.$$"
+  ensure_private_directory "${staging}"
+  trap 'safe_cleanup "${staging:-}"' EXIT HUP INT TERM
+  emit_progress extract 'Extracting the verified ROCm runtime into a private staging directory'
+  if [[ "${format}" == tar ]]; then
+    if tar -tzf "${bundle}" | grep -Eq '(^/|(^|/)\.\.(/|$))'; then
+      emit_error unsafe_archive 'Runtime archive contains an unsafe path' 29
+    fi
+    tar -xzf "${bundle}" -C "${staging}"
+  else
+    require_command bash
+    local work="${staging}/installer-work" target="${staging}/payload"
+    mkdir -p -- "${work}" "${target}"
+    emit_progress dependencies 'Validating official ROCm runfile prerequisites without installing system packages'
+    (cd -- "${work}" && bash "${bundle}" deps=validate rocm) \
+      || emit_error system_authorization_required 'ROCm system prerequisites are missing; the wallet must request explicit administrator installation' 30
+    emit_progress install 'Running the official ROCm installer in the private staging directory'
+    (cd -- "${work}" && bash "${bundle}" "target=${target}" rocm nopostrocm assumeyes) \
+      || emit_error installer_failed 'The official ROCm runfile installer failed; the previous runtime remains active' 31
+  fi
+  extracted="$(find_extracted_runtime "${staging}" || true)"
+  [[ -n "${extracted}" ]] || emit_error runtime_incomplete 'Extracted bundle contains no coherent ROCm root' 21
+  probe_runtime "${extracted}" || emit_error runtime_incomplete "${runtime_error}" 21
+  if [[ "${architecture}" != auto ]] && ! csv_contains "${runtime_architectures}" "${architecture}"; then
+    emit_error architecture_missing "Installed rocBLAS does not contain ${architecture}" 32
+  fi
+  identifier="${runtime_version}-${architecture}-${actual_sha:0:16}"
+  install_dir="${state_dir}/runtimes/${identifier}"
+  ensure_private_directory "${state_dir}/runtimes"
+  if [[ -e "${install_dir}" ]]; then
+    probe_runtime "${install_dir}" || emit_error existing_runtime_invalid "Existing runtime directory is invalid: ${install_dir}" 33
+  else
+    mv -- "${extracted}" "${install_dir}"
+    runtime_root="${install_dir}"
+  fi
+  probe_runtime "${install_dir}" || emit_error runtime_incomplete "${runtime_error}" 21
+  write_active_manifest "${source}" "${actual_sha}" "${architecture}"
+  safe_cleanup "${staging}"
+  trap - EXIT HUP INT TERM
+  printf '{"schema":"%s","schema_version":1,"status":"ready","reused":false,"runtime_root":"%s","runtime_version":"%s","archive_sha256":"%s","architectures":"%s","error":null}\n' \
+    "${schema}" "$(json_escape "${runtime_root}")" "$(json_escape "${runtime_version}")" \
+    "${actual_sha}" "$(json_escape "${runtime_architectures}")"
+}
+
+prepare_runtime() {
+  local architecture=auto authorize=false bundle='' expected_sha='-' argument
+  while (($#)); do
+    argument=$1; shift
+    case "${argument}" in
+      --architecture) (($#)) || emit_error invalid_arguments '--architecture requires a value' 2; architecture=${1,,}; shift ;;
+      --authorize-download) authorize=true ;;
+      --bundle) (($#)) || emit_error invalid_arguments '--bundle requires a path' 2; bundle=$1; shift ;;
+      --sha256) (($#)) || emit_error invalid_arguments '--sha256 requires a value' 2; expected_sha=${1,,}; shift ;;
+      *) emit_error invalid_arguments "Unknown prepare argument: ${argument}" 2 ;;
+    esac
+  done
+  [[ "${architecture}" == auto || "${architecture}" =~ ^gfx[0-9a-f]+$ ]] \
+    || emit_error invalid_architecture 'Architecture must be auto or a normalized gfx target' 2
+
+  ensure_private_directory "${state_dir}"
+  require_command flock
+  { exec 9>"${state_dir}/prepare.lock"; } 2>/dev/null \
+    || emit_error state_not_writable "Cannot create runtime preparation lock in ${state_dir}" 40
+  flock -n 9 || emit_error preparation_in_progress 'Another runtime preparation process holds the lock' 34
+
+  if [[ -z "${bundle}" ]] && locate_runtime; then
+    if [[ "${architecture}" == auto ]] || csv_contains "${runtime_architectures}" "${architecture}"; then
+      if [[ "${runtime_source}" == manifest ]]; then
+        verify_active false >/dev/null
+      else
+        write_active_manifest "${runtime_source}" - "${architecture}"
+      fi
+      printf '{"schema":"%s","schema_version":1,"status":"ready","reused":true,"runtime_root":"%s","runtime_version":"%s","architectures":"%s","error":null}\n' \
+        "${schema}" "$(json_escape "${runtime_root}")" "$(json_escape "${runtime_version}")" "$(json_escape "${runtime_architectures}")"
+      return 0
+    fi
+  fi
+
+  require_command sha256sum
+  require_command tar
+  require_command realpath
+  if [[ -n "${bundle}" ]]; then
+    install_bundle "$(realpath -e -- "${bundle}")" "${expected_sha}" tar "${architecture}" offline_bundle
+    return
+  fi
+  [[ "${authorize}" == true ]] || emit_error authorization_required 'Runtime download requires explicit user authorization' 35
+  catalog_entry "${architecture}" || emit_error architecture_not_packaged "No official ROCm 7.14 package is catalogued for ${architecture}" 36
+  [[ "${package_url}" == https://repo.amd.com/rocm/tarball-multi-arch/* \
+     || "${package_url}" == https://repo.radeon.com/rocm/installer/rocm-runfile-installer/* \
+     || "${CMFD_HIP_TEST_ALLOW_FILE_URL:-0}" == 1 ]] \
+    || emit_error untrusted_source 'Runtime URL is not on an approved AMD HTTPS origin' 37
+  require_command curl
+  local downloads="${state_dir}/downloads" filename archive partial checksum_file download_url actual_length cached_sha download_input
+  ensure_private_directory "${downloads}"
+  filename=${package_url##*/}
+  archive="${downloads}/${filename}"
+  partial="${archive}.part"
+  checksum_file="${downloads}/${filename}.sha256"
+  download_url=${package_url}
+  if [[ "${package_object}" != - ]]; then download_url+="?versionId=${package_object}"; fi
+  download_input=${archive}
+  if [[ ! -f "${archive}" ]]; then
+    emit_progress download "Downloading ${package_family} ROCm ${package_version} from the pinned AMD origin"
+    curl --proto '=https' --tlsv1.2 --fail --location --retry 2 --continue-at - \
+      --output "${partial}" "${download_url}" \
+      || emit_error network_unavailable 'ROCm runtime download failed or was interrupted; the partial file is retained for resume' 38
+    download_input=${partial}
+  else
+    emit_progress cache "Reusing the complete cached ${package_family} ROCm ${package_version} archive"
+  fi
+  actual_length="$(stat -Lc '%s' -- "${download_input}")"
+  [[ "${actual_length}" == "${package_length}" ]] || emit_error download_incomplete "Downloaded size ${actual_length} does not match expected ${package_length}" 39
+  cached_sha='-'
+  [[ -r "${checksum_file}" ]] && IFS= read -r cached_sha <"${checksum_file}"
+  expected_sha=${expected_sha:--}
+  [[ "${expected_sha}" != - ]] || expected_sha=${cached_sha}
+  local actual_sha
+  actual_sha="$(sha256sum -- "${download_input}" | awk '{print $1}')"
+  [[ "${expected_sha}" == - || "${actual_sha}" == "${expected_sha}" ]] \
+    || emit_error download_corrupt 'Downloaded archive no longer matches its recorded SHA-256' 27
+  if [[ "${download_input}" == "${partial}" ]]; then
+    mv -f -- "${partial}" "${archive}"
+    download_input=${archive}
+  fi
+  printf '%s\n' "${actual_sha}" >"${checksum_file}"
+  chmod 600 -- "${checksum_file}" "${download_input}"
+  install_bundle "${download_input}" "${actual_sha}" "${package_format}" "${architecture}" \
+    "official_amd_${package_family}"
+}
+
+usage() {
+  printf '%s\n' 'usage: cmfd-hip-runtime {status|resolve|prepare|adopt|verify} [options]'
+}
+
+command_name=${1:-status}
+shift || true
+case "${command_name}" in
+  status|probe)
+    (($# == 0)) || emit_error invalid_arguments 'status accepts no arguments' 2
+    emit_status
+    ;;
+  resolve)
+    (($# == 0)) || emit_error invalid_arguments 'resolve accepts no arguments' 2
+    locate_runtime || emit_error runtime_unavailable "${runtime_error}" 3
+    printf '%s\n' "${runtime_root}"
+    ;;
+  adopt)
+    (($# == 1)) || emit_error invalid_arguments 'adopt requires one absolute ROCm root' 2
+    ensure_private_directory "${state_dir}"
+    require_command flock
+    { exec 9>"${state_dir}/prepare.lock"; } 2>/dev/null \
+      || emit_error state_not_writable "Cannot create runtime preparation lock in ${state_dir}" 40
+    flock -n 9 || emit_error preparation_in_progress 'Another runtime preparation process holds the lock' 34
+    adopt_runtime "$1"
+    ;;
+  verify)
+    if (($# == 0)); then verify_active false
+    elif (($# == 1)) && [[ "$1" == --deep ]]; then verify_active true
+    else emit_error invalid_arguments 'verify accepts only --deep' 2
+    fi
+    ;;
+  prepare) prepare_runtime "$@" ;;
+  --help|-h|help) usage ;;
+  *) usage >&2; emit_error invalid_arguments "Unknown command: ${command_name}" 2 ;;
+esac

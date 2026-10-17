@@ -1,0 +1,12 @@
+# schema=common-foundry.amd-hip.packages-v1
+# format family architectures version url content_length object_version
+runfile	auto	auto	7.14.0	https://repo.radeon.com/rocm/installer/rocm-runfile-installer/rocm-rel-7.14/rocm-installer-7.14.0-7.run	5863415408	-
+tar	gfx908	gfx908	7.14.0	https://repo.amd.com/rocm/tarball-multi-arch/therock-dist-linux-gfx908-7.14.0.tar.gz	1880171887	VIYYWfQ6wcgx.TWD9u4HKorbRsKqsUWB
+tar	gfx90a	gfx90a	7.14.0	https://repo.amd.com/rocm/tarball-multi-arch/therock-dist-linux-gfx90a-7.14.0.tar.gz	2045478057	_e50G0x3sK9kQgPbQr85diEd9RAe9O64
+tar	gfx94x	gfx942	7.14.0	https://repo.amd.com/rocm/tarball-multi-arch/therock-dist-linux-gfx94X-dcgpu-7.14.0.tar.gz	3172622960	wDR_J7MH6pJ0_2bmuMYAFGWQMTekLRn1
+tar	gfx101x	gfx1010,gfx1011,gfx1012	7.14.0	https://repo.amd.com/rocm/tarball-multi-arch/therock-dist-linux-gfx101X-dgpu-7.14.0.tar.gz	1693544386	eLaqX_HyvAWjeQ8ElRGi7jN525pFoMr.
+tar	gfx103x	gfx1030,gfx1031,gfx1032,gfx1033,gfx1034,gfx1035,gfx1036	7.14.0	https://repo.amd.com/rocm/tarball-multi-arch/therock-dist-linux-gfx103X-all-7.14.0.tar.gz	2397294419	B2Q7FOci2Eq4FB5yuzswRUBSfXVnOi5h
+tar	gfx110x	gfx1100,gfx1101,gfx1102,gfx1103	7.14.0	https://repo.amd.com/rocm/tarball-multi-arch/therock-dist-linux-gfx110X-all-7.14.0.tar.gz	2313039793	wYAKecpaRE3x8DZud4O_NLJcPHWdqt9j
+tar	gfx1150	gfx1150	7.14.0	https://repo.amd.com/rocm/tarball-multi-arch/therock-dist-linux-gfx1150-7.14.0.tar.gz	1689708215	IwMYLubbg1CAuyznzjHQvmZayTDpFyPi
+tar	gfx1151	gfx1151	7.14.0	https://repo.amd.com/rocm/tarball-multi-arch/therock-dist-linux-gfx1151-7.14.0.tar.gz	1713449440	DyrifezUs82z60Mlr8SGUADveZGtgZyZ
+tar	gfx120x	gfx1200,gfx1201	7.14.0	https://repo.amd.com/rocm/tarball-multi-arch/therock-dist-linux-gfx120X-all-7.14.0.tar.gz	2335736269	xnf6YU5SPU.rMbL7zcApnThXxQb.juDA

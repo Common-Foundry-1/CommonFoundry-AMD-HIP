@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+lab_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+worker="${CMFD_HIP_REPLAY_NATIVE:-${lab_dir}/cmfd-v4-hip-replay}"
+manager="${CMFD_HIP_RUNTIME_MANAGER:-${lab_dir}/cmfd-hip-runtime}"
+if [[ ! -x "${worker}" && -x "${lab_dir}/build/bin/cmfd-v4-hip-replay" ]]; then
+  worker="${lab_dir}/build/bin/cmfd-v4-hip-replay"
+fi
+if [[ ! -x "${manager}" && -x "${lab_dir}/runtime/cmfd-hip-runtime" ]]; then
+  manager="${lab_dir}/runtime/cmfd-hip-runtime"
+fi
+
+if [[ ! -x "${worker}" ]]; then
+  printf 'HIP replay worker is not built: %s\n' "${worker}" >&2
+  exit 1
+fi
+if [[ ! -x "${manager}" ]]; then
+  printf 'HIP runtime manager is missing: %s\n' "${manager}" >&2
+  exit 1
+fi
+
+runtime_root="$(${manager} resolve)" || {
+  printf '%s\n' 'HIP runtime is not prepared; run cmfd-hip-runtime prepare first.' >&2
+  exit 3
+}
+[[ "${runtime_root}" == /* ]] || {
+  printf '%s\n' 'HIP runtime manager returned a non-absolute path.' >&2
+  exit 3
+}
+export CMFD_HIP_RUNTIME_ROOT="${runtime_root}"
+runtime_paths="${runtime_root}/lib:${runtime_root}/lib/rocm_sysdeps/lib:${runtime_root}/lib/llvm/lib"
+export LD_LIBRARY_PATH="${runtime_paths}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+
+# The closed-source v1.0.13 coordinator always exports the selected NVIDIA
+# UUID through CUDA_VISIBLE_DEVICES.  HIP also honors that compatibility
+# variable, so the synthetic UUID used to pass coordinator discovery would
+# otherwise hide every AMD device.  Keep native HIP_VISIBLE_DEVICES intact.
+unset CUDA_VISIBLE_DEVICES
+unset NVIDIA_VISIBLE_DEVICES
+
+device_arguments=()
+if [[ -n "${CMFD_HIP_DEVICE_SELECTOR:-}" ]]; then
+  device_arguments=(--device-selector "${CMFD_HIP_DEVICE_SELECTOR}")
+elif [[ -n "${CMFD_HIP_DEVICE:-}" ]]; then
+  device_arguments=(--device "${CMFD_HIP_DEVICE}")
+fi
+
+exec "${worker}" "${device_arguments[@]}" "$@"

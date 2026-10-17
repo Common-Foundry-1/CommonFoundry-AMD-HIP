@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Compatibility probe for the closed-source v1.0.13 pool coordinator.  The
+# coordinator insists on NVIDIA telemetry even when its replay worker is an
+# external executable.  It only consumes this CSV row to select/lock GPU 0;
+# actual execution and device selection remain in the HIP worker.
+case " ${*} " in
+  *" --query-gpu="*" --format=csv,noheader,nounits "*)
+    printf '%s\n' '0, GPU-00000000-0000-0000-0000-000000000000, 0, 0, 0, 0, 0, 0, 0, 0, 24564'
+    ;;
+  *" -L "*|*" --list-gpus "*)
+    printf '%s\n' 'GPU 0: AMD Radeon RX 7900 XTX (UUID: GPU-00000000-0000-0000-0000-000000000000)'
+    ;;
+  *)
+    printf 'AMD HIP compatibility shim: unsupported nvidia-smi arguments: %s\n' "$*" >&2
+    exit 2
+    ;;
+esac

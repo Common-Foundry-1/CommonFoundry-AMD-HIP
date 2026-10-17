@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+manager="${CMFD_HIP_RUNTIME_MANAGER:-${script_dir}/cmfd-hip-runtime}"
+native="${CMFD_HIP_DISCOVERY_NATIVE:-${script_dir}/cmfd-hip-discovery-native}"
+if [[ ! -x "${native}" && -x "${script_dir}/../build/bin/cmfd-hip-discovery-native" ]]; then
+  native="${script_dir}/../build/bin/cmfd-hip-discovery-native"
+fi
+[[ -x "${native}" ]] || {
+  printf '%s\n' '{"schema":"common-foundry.amd-hip.discovery","schema_version":1,"backend":"amd-hip","status":"error","devices":[],"selection":null,"error":{"code":"discovery_binary_missing","message":"Native AMD HIP discovery binary is missing"}}'
+  exit 3
+}
+
+runtime_root=''
+if [[ -x "${manager}" ]]; then
+  runtime_root="$(${manager} resolve 2>/dev/null || true)"
+fi
+if [[ -n "${runtime_root}" && "${runtime_root}" == /* ]]; then
+  export CMFD_HIP_RUNTIME_ROOT="${runtime_root}"
+  runtime_paths="${runtime_root}/lib:${runtime_root}/lib/rocm_sysdeps/lib:${runtime_root}/lib/llvm/lib"
+  export LD_LIBRARY_PATH="${runtime_paths}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+fi
+
+exec "${native}" "$@"
