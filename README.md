@@ -39,6 +39,22 @@ CMFD_HIP_AUTHORIZE_DOWNLOAD=1 \
 `CMFD_HIP_AUTHORIZE_DOWNLOAD=1` is only needed on first start if ROCm 7.14 is
 not already installed. See [docs/LINUX_DEPLOYMENT.md](docs/LINUX_DEPLOYMENT.md).
 
+## Windows (WSL2, experimental)
+
+Runs inside Ubuntu on WSL2 using AMD's official WSL driver bridge. Run
+`bin/wsl-setup.sh` once, then start as above or with
+`Start-CMFD-AMD-Miner-WSL.cmd` from Windows. Not yet tested on a real AMD GPU
+under WSL2; see [docs/WSL.md](docs/WSL.md).
+
+## Mining screen
+
+`run-miner.sh` shows a live screen with hashrate (now, average and per GPU
+batch), accepted/rejected/stale shares, blocks, pool credit, power draw,
+efficiency, temperatures, fan, load, clocks and VRAM. Ctrl+C stops mining.
+A full log is kept; `CMFD_SCREEN=0` gives plain output. Readings come from
+the amdgpu driver on Linux and AMD SMI on WSL2, and also replace the zeros the
+coordinator used to print for power and temperature.
+
 ## Build from source
 
 Requires ROCm/HIP 7.14, rocBLAS, CMake 3.21+ and a C++20 compiler.
@@ -72,3 +88,7 @@ and `analysis/`. The 2026-10-14 and 2026-10-15 qualification reports are in
 
 AMD HIP worker, discovery, runtime manager, tests and documentation by
 **Qcvibes1**. Thank you!
+
+WSL2 support, the mining screen and AMD telemetry were added by the Common
+Foundry project (`tools/amd_gpu_telemetry.py`, `tools/cmfd-amd-screen`,
+`tools/wsl-setup.sh`, `docs/WSL.md`, `windows/`).

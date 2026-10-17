@@ -219,6 +219,24 @@ device_access_state() {
   fi
 }
 
+# WSL2 exposes GPUs through /dev/dxg (AMD's librocdxg bridge) instead of /dev/kfd.
+wsl_dxg_present() {
+  [[ -e "${CMFD_HIP_DXG_DEVICE:-/dev/dxg}" && ! -e /dev/kfd ]]
+}
+
+# Ask AMD SMI for WSL (installed by wsl-setup.sh) for the GPU's gfx target.
+wsl_architecture() {
+  local helper
+  for helper in "${CMFD_HIP_TELEMETRY:-}" "${script_dir}/../tools/amd_gpu_telemetry.py" \
+                "${script_dir}/../libexec/common-foundry-amd-hip/amd_gpu_telemetry.py"; do
+    [[ -n "${helper}" && -r "${helper}" ]] || continue
+    command -v python3 >/dev/null 2>&1 || return 1
+    timeout 60 python3 -I "${helper}" --architecture 2>/dev/null
+    return
+  done
+  return 1
+}
+
 emit_status() {
   local os_id=unknown os_version=unknown kfd dri amd_devices
   if [[ -r /etc/os-release ]]; then
@@ -248,9 +266,10 @@ emit_status() {
   done
   printf '],"error":'
   if [[ -n "${runtime_error:-}" ]]; then printf '"%s"' "$(json_escape "${runtime_error}")"; else printf null; fi
-  printf '},"system":{"os_id":"%s","os_version":"%s","kernel":"%s","kfd":"%s","dri_render":"%s","amd_pci_devices":%s},"network_required":%s,"authorization_required":%s,"error":null}\n' \
+  printf '},"system":{"os_id":"%s","os_version":"%s","kernel":"%s","kfd":"%s","dri_render":"%s","dxg":"%s","wsl":%s,"amd_pci_devices":%s},"network_required":%s,"authorization_required":%s,"error":null}\n' \
     "$(json_escape "${os_id}")" "$(json_escape "${os_version}")" "$(json_escape "$(uname -r)")" \
-    "${kfd}" "${dri}" "${amd_devices}" \
+    "${kfd}" "${dri}" "$(device_access_state "${CMFD_HIP_DXG_DEVICE:-/dev/dxg}")" \
+    "$(wsl_dxg_present && printf true || printf false)" "${amd_devices}" \
     "$([[ "${runtime_ready}" == true ]] && printf false || printf true)" \
     "$([[ "${runtime_ready}" == true ]] && printf false || printf true)"
 }
@@ -451,6 +470,14 @@ prepare_runtime() {
         "${schema}" "$(json_escape "${runtime_root}")" "$(json_escape "${runtime_version}")" "$(json_escape "${runtime_architectures}")"
       return 0
     fi
+  fi
+
+  if [[ "${architecture}" == auto && -z "${bundle}" ]] && wsl_dxg_present; then
+    # The native-Linux runfile installer does not apply to WSL2; use the
+    # official per-architecture tarball for the GPU that AMD SMI reports.
+    architecture="$(wsl_architecture)" && [[ "${architecture}" =~ ^gfx[0-9a-f]+$ ]] \
+      || emit_error wsl_setup_required 'WSL2 detected but AMD SMI for WSL reported no AMD GPU; run wsl-setup.sh first' 41
+    emit_progress wsl "WSL2 AMD GPU architecture ${architecture}"
   fi
 
   require_command sha256sum

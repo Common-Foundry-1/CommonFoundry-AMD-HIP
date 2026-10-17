@@ -31,6 +31,10 @@ runtime_root="$(${manager} resolve)" || {
 export CMFD_HIP_RUNTIME_ROOT="${runtime_root}"
 runtime_paths="${runtime_root}/lib:${runtime_root}/lib/rocm_sysdeps/lib:${runtime_root}/lib/llvm/lib"
 export LD_LIBRARY_PATH="${runtime_paths}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+# WSL2: let ROCm reach the GPU through AMD's librocdxg bridge.
+if [[ -e /dev/dxg && ! -e /dev/kfd ]]; then
+  export HSA_ENABLE_DXG_DETECTION=1
+fi
 
 # The closed-source v1.0.13 coordinator always exports the selected NVIDIA
 # UUID through CUDA_VISIBLE_DEVICES.  HIP also honors that compatibility

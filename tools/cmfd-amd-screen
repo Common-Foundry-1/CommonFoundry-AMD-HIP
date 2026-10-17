@@ -1,0 +1,391 @@
+#!/usr/bin/env python3
+"""Mining screen for the Common Foundry AMD HIP miner.
+
+Added by the Common Foundry project. Standard library only.
+
+Runs the official cmfd-miner coordinator as a child process, keeps a full log,
+samples AMD GPU telemetry in the background (and caches it for the nvidia-smi
+compatibility probe), and draws a live status screen with hashrate, shares,
+power, efficiency, temperatures, fan, clocks, load and VRAM.
+
+Without a terminal, or with CMFD_SCREEN=0, the coordinator output is passed
+through unchanged and only the log and telemetry cache are kept.
+
+usage: cmfd-amd-screen [--log FILE] -- COORDINATOR [ARGS...]
+"""
+
+from __future__ import annotations
+
+import argparse
+import collections
+import importlib.util
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+
+ATOMS_PER_CMFD = 100_000_000
+REFRESH_SECONDS = 1.0
+SAMPLE_SECONDS = 2.0
+
+STATS = re.compile(
+    r"MINER STATS \| GPU \S+ \(\S+\) \| height (?P<height>\d+) \| hashrate (?P<rate>[\d.]+) FW/s"
+    r" \| accepted (?P<accepted>\d+) \| rejected (?P<rejected>\d+) \| stale (?P<stale>\d+)"
+    r" \| blocks (?P<blocks>\d+) \| credit (?P<credit>\d+) atoms")
+REPLAY = re.compile(r"CMFD_HIP_REPLAY .*?\bfw_per_second=(?P<gpu>[\d.]+).*?\beffective_fw_per_second=(?P<eff>[\d.]+)")
+CONNECTED = re.compile(r"Connected to pool at height (\d+)")
+
+
+def load_telemetry_module():
+    path = Path(__file__).resolve().with_name("amd_gpu_telemetry.py")
+    spec = importlib.util.spec_from_file_location("amd_gpu_telemetry", path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def duration(seconds: float | None) -> str:
+    if seconds is None:
+        return "-"
+    seconds = int(max(seconds, 0))
+    hours, rest = divmod(seconds, 3600)
+    minutes, seconds = divmod(rest, 60)
+    if hours:
+        return f"{hours}h {minutes:02d}m {seconds:02d}s"
+    if minutes:
+        return f"{minutes}m {seconds:02d}s"
+    return f"{seconds}s"
+
+
+def value(number: object, unit: str = "", digits: int = 0) -> str:
+    if number is None:
+        return "N/A"
+    text = f"{float(number):,.{digits}f}"
+    return f"{text} {unit}".rstrip() if unit and not unit.startswith("%") else text + unit
+
+
+class Miner:
+    """State parsed from coordinator output and telemetry samples."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.started = time.time()
+        self.pool = self.worker = self.payout = None
+        self.status, self.status_color = "Starting", "yellow"
+        self.height = None
+        self.rate = None
+        self.rate_samples: list[float] = []
+        self.gpu_rate = self.effective_rate = None
+        self.batches = 0
+        self.accepted = self.rejected = self.stale = self.blocks = self.credit = 0
+        self.last_share = None
+        self.telemetry: dict[str, object] = {}
+        self.telemetry_error = None
+        self.events: collections.deque = collections.deque(maxlen=6)
+
+    def event(self, text: str, color: str | None = None) -> None:
+        self.events.append((time.strftime("%H:%M:%S"), text, color))
+
+    def parse(self, line: str) -> None:
+        with self.lock:
+            self._parse(line)
+
+    def _parse(self, line: str) -> None:
+        match = STATS.search(line)
+        if match:
+            rate = float(match["rate"])
+            self.rate, self.height = rate, int(match["height"])
+            if rate > 0:
+                self.rate_samples.append(rate)
+            accepted, rejected = int(match["accepted"]), int(match["rejected"])
+            stale, blocks = int(match["stale"]), int(match["blocks"])
+            if accepted > self.accepted:
+                self.last_share = time.time()
+                self.event(f"Share accepted (total {accepted})", "green")
+            if rejected > self.rejected:
+                kind = "stale" if stale > self.stale else "rejected"
+                self.event(f"Share {kind} (total {rejected})", "yellow")
+            if blocks > self.blocks:
+                self.event("BLOCK FOUND by this worker!", "green")
+            self.accepted, self.rejected, self.stale, self.blocks = accepted, rejected, stale, blocks
+            self.credit = int(match["credit"])
+            return
+        match = REPLAY.search(line)
+        if match:
+            self.gpu_rate, self.effective_rate = float(match["gpu"]), float(match["eff"])
+            self.batches += 1
+            return
+        match = CONNECTED.search(line)
+        if match:
+            self.status, self.status_color = "Connected", "green"
+            self.height = int(match.group(1))
+            self.event(f"Connected to pool at height {self.height}", "green")
+            return
+        for prefix, attribute in (("Pool: ", "pool"), ("Worker: ", "worker"), ("Payout: ", "payout")):
+            if line.startswith(prefix):
+                setattr(self, attribute, line[len(prefix):].strip())
+                return
+        if line.startswith("Pool unavailable") or line.startswith("Pool connection lost"):
+            self.status, self.status_color = "Reconnecting", "yellow"
+            self.event(line[:120], "yellow")
+        elif line.startswith("Pool miner stopped"):
+            self.status, self.status_color = "Stopped", "yellow"
+            self.event("Pool miner stopped", "yellow")
+        elif "BLOCK ACCEPTED" in line:
+            self.event(line[:120], "green")
+        elif line.startswith("CMFD_HIP_SELF_TEST PASS"):
+            self.event("GPU self-test passed", "green")
+        elif line.startswith("CMFD_HIP_MODEL_READY"):
+            self.event("Model loaded into VRAM", "green")
+        elif line.startswith("CMFD_HIP_ERROR") or line.lower().startswith("error"):
+            self.event(line[:120], "red")
+        elif "WARNING" in line:
+            self.event(line[:120], "yellow")
+
+
+class Screen:
+    COLORS = {"green": "32", "yellow": "33", "red": "31", "cyan": "36", "dim": "2", "bold": "1"}
+    ESCAPE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+    def __init__(self, miner: Miner, gpu_name: str, gpu_arch: str, log_path: str | None) -> None:
+        self.miner, self.gpu_name, self.gpu_arch, self.log_path = miner, gpu_name, gpu_arch, log_path
+        self.color = "NO_COLOR" not in os.environ
+
+    def paint(self, text: str, color: str | None) -> str:
+        if not color or not self.color:
+            return text
+        return f"\x1b[{self.COLORS[color]}m{text}\x1b[0m"
+
+    def fit(self, line: str, width: int) -> str:
+        out, visible, index = [], 0, 0
+        while index < len(line) and visible < width:
+            match = self.ESCAPE.match(line, index)
+            if match:
+                out.append(match.group())
+                index = match.end()
+                continue
+            out.append(line[index])
+            visible += 1
+            index += 1
+        return "".join(out) + ("\x1b[0m" if self.color else "")
+
+    def label(self, text: str) -> str:
+        return self.paint(f"  {text:<10}", "dim")
+
+    def temperature(self, number: object, warn: float, hot: float, name: str) -> str:
+        if number is None:
+            return f"N/A {name}"
+        color = "red" if float(number) >= hot else "yellow" if float(number) >= warn else "green"
+        return self.paint(f"{float(number):.0f}°C", color) + f" {name}"
+
+    def lines(self, width: int, stopping: bool) -> list[str]:
+        m = self.miner
+        with m.lock:
+            t = dict(m.telemetry)
+            now = time.time()
+            rule = self.paint("─" * max(width - 2, 10), "dim")
+            pool = re.sub(r"\?.*$", "", m.pool or "-")
+            payout = m.payout or "-"
+            if len(payout) > 20:
+                payout = f"{payout[:8]}…{payout[-8:]}"
+            name = self.gpu_name or t.get("name") or "AMD GPU"
+            arch = self.gpu_arch or t.get("architecture") or ""
+            backend = {"amdsmi-wsl": "WSL2 · AMD SMI", "sysfs": "Linux · amdgpu"}.get(str(t.get("backend")), "")
+            average = sum(m.rate_samples) / len(m.rate_samples) if m.rate_samples else None
+            total = m.accepted + m.rejected
+            accept = f"{100.0 * m.accepted / total:.1f}%" if total else "-"
+            hours = (now - m.started) / 3600
+            per_hour = f"{m.accepted / hours:.1f}/h" if hours > 0.01 else "-"
+            last = f"last {duration(now - m.last_share)} ago" if m.last_share else "no share yet"
+            power = t.get("power_w")
+            efficiency = (m.rate * 3_600_000 / float(power)) if m.rate and power else None
+            limit = f" / {value(t.get('power_limit_w'), 'W')}" if t.get("power_limit_w") else ""
+            vram = (f"{float(t['vram_used_mib']) / 1024:.1f} / {float(t['vram_total_mib']) / 1024:.1f} GB"
+                    if t.get("vram_used_mib") is not None and t.get("vram_total_mib") else "N/A")
+            fan = value(t.get("fan_percent"), "%")
+            if t.get("fan_rpm") is not None:
+                fan += f"  {value(t.get('fan_rpm'), 'RPM')}"
+            status = "Stopping…" if stopping else m.status
+            title = self.paint(" COMMON FOUNDRY AMD HIP MINER", "bold")
+            right = f"Uptime {duration(now - m.started)}   Ctrl+C to stop "
+            gap = max(width - 29 - len(right), 1)
+            out = [
+                title + " " * gap + right,
+                rule,
+                self.label("Pool") + f"{pool:<36}" + self.paint("Status  ", "dim")
+                + self.paint("● " + status, "yellow" if stopping else m.status_color),
+                self.label("Worker") + f"{(m.worker or '-'):<36}" + self.paint("Height  ", "dim")
+                + (f"{m.height:,}" if m.height is not None else "-"),
+                self.label("Payout") + f"{payout:<36}" + self.paint("Batches ", "dim") + f"{m.batches:,}",
+                self.label("GPU") + f"{name}  {arch}" + (self.paint(f"  ({backend})", "dim") if backend else ""),
+                rule,
+                self.label("Hashrate") + self.paint(f"{value(m.rate, 'FW/s', 2):<14}", "cyan")
+                + f" avg {value(average, 'FW/s', 2):<14} GPU batch {value(m.gpu_rate, 'FW/s', 2)}",
+                self.label("Shares") + self.paint(f"{m.accepted} accepted", "green")
+                + f"   {m.rejected} rejected   {m.stale} stale   {accept}   {per_hour}   {last}",
+                self.label("Blocks") + f"{m.blocks:<14} pool credit {m.credit / ATOMS_PER_CMFD:,.8f} CMFD",
+                rule,
+                self.label("Power") + f"{value(power, 'W'):<5}{limit:<12} efficiency {value(efficiency, 'FW/kWh')}",
+                self.label("Temp") + "   ".join((
+                    self.temperature(t.get("temp_edge_c"), 75, 85, "edge"),
+                    self.temperature(t.get("temp_hotspot_c"), 90, 100, "hotspot"),
+                    self.temperature(t.get("temp_mem_c"), 85, 95, "memory"))),
+                self.label("Fan") + f"{fan:<20} load {value(t.get('load_percent'), '%')}",
+                self.label("Clocks") + f"{value(t.get('core_clock_mhz'), 'MHz')} core   "
+                + f"{value(t.get('mem_clock_mhz'), 'MHz')} memory",
+                self.label("VRAM") + vram,
+                rule,
+            ]
+            if m.telemetry_error:
+                out.append(self.paint(f"  Telemetry unavailable: {m.telemetry_error}", "yellow"))
+            for stamp, text, color in m.events:
+                out.append(f"  {self.paint(stamp, 'dim')}  {self.paint(text, color)}")
+            if self.log_path:
+                out.append(self.paint(f"  Log: {self.log_path}", "dim"))
+        return [self.fit(line, width - 1) for line in out]
+
+    def draw(self, stopping: bool) -> None:
+        size = shutil.get_terminal_size((100, 30))
+        frame = self.lines(size.columns, stopping)[: max(size.lines - 1, 5)]
+        sys.stdout.write("\x1b[H" + "".join(line + "\x1b[K\n" for line in frame) + "\x1b[J")
+        sys.stdout.flush()
+
+
+def sampler(miner: Miner, telemetry, backend, cache: str | None, stop: threading.Event) -> None:
+    while True:
+        sample = None
+        if backend is not None:
+            try:
+                sample = backend.sample()
+            except Exception as error:  # noqa: BLE001 - keep mining without telemetry
+                with miner.lock:
+                    miner.telemetry_error = str(error)
+        if sample is not None:
+            with miner.lock:
+                miner.telemetry = sample
+                miner.telemetry_error = None
+        if cache and telemetry is not None:
+            try:
+                telemetry.write_cache(cache, sample or {})
+            except OSError:
+                pass
+        if stop.wait(SAMPLE_SECONDS):
+            return
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Common Foundry AMD HIP mining screen")
+    parser.add_argument("--log", help="append all coordinator output to this file")
+    parser.add_argument("command", nargs=argparse.REMAINDER)
+    arguments = parser.parse_args()
+    command = arguments.command[1:] if arguments.command[:1] == ["--"] else arguments.command
+    if not command:
+        parser.error("coordinator command is required after --")
+
+    miner = Miner()
+    telemetry = backend = None
+    try:
+        telemetry = load_telemetry_module()
+        backend = telemetry.open_backend()
+    except Exception as error:  # noqa: BLE001
+        miner.telemetry_error = str(error)
+    cache = os.environ.get("CMFD_HIP_TELEMETRY_CACHE") or None
+    stop = threading.Event()
+    sampling = threading.Thread(target=sampler, args=(miner, telemetry, backend, cache, stop), daemon=True)
+    if backend is not None or cache:
+        # The first sample lands in the cache before the coordinator's GPU probe.
+        first_only = threading.Event()
+        first_only.set()
+        sampler(miner, telemetry, backend, cache, first_only)
+        sampling.start()
+
+    log = None
+    if arguments.log:
+        Path(arguments.log).parent.mkdir(parents=True, exist_ok=True)
+        log = open(arguments.log, "a", buffering=1, encoding="utf-8", errors="replace")
+    interactive = sys.stdout.isatty() and os.environ.get("CMFD_SCREEN", "1") != "0"
+    screen = Screen(miner, os.environ.get("CMFD_HIP_GPU_NAME", ""), os.environ.get("CMFD_HIP_GPU_ARCH", ""),
+                    arguments.log)
+
+    child = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    interrupts = 0
+
+    def on_signal(number, _frame):
+        # Ctrl+C already reaches the coordinator through the terminal's process
+        # group; it stops cleanly and quits the HIP worker.  Escalate on repeats.
+        nonlocal interrupts
+        interrupts += 1
+        if interrupts >= 3:
+            child.kill()
+        elif number == signal.SIGTERM or interrupts == 2:
+            child.terminate()
+
+    signal.signal(signal.SIGINT, on_signal)
+    signal.signal(signal.SIGTERM, on_signal)
+
+    def reader() -> None:
+        assert child.stdout is not None
+        for raw in iter(child.stdout.readline, b""):
+            line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+            if log:
+                log.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {line}\n")
+            miner.parse(line)
+            if not interactive:
+                sys.stdout.write(line + "\n")
+                sys.stdout.flush()
+
+    reading = threading.Thread(target=reader, daemon=True)
+    reading.start()
+
+    terminal = None
+    if interactive:
+        try:
+            import termios
+            if sys.stdin.isatty():
+                terminal = termios.tcgetattr(sys.stdin)
+                quiet = termios.tcgetattr(sys.stdin)
+                quiet[3] &= ~(termios.ECHO | termios.ICANON)
+                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, quiet)
+        except (ImportError, OSError):
+            terminal = None
+        sys.stdout.write("\x1b[?1049h\x1b[?25l")
+    try:
+        while child.poll() is None:
+            if interactive:
+                screen.draw(stopping=interrupts > 0)
+            time.sleep(REFRESH_SECONDS)
+        reading.join(timeout=5)
+    finally:
+        if interactive:
+            sys.stdout.write("\x1b[?25h\x1b[?1049l")
+            sys.stdout.flush()
+            if terminal is not None:
+                import termios
+                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, terminal)
+        stop.set()
+        if log:
+            log.close()
+
+    with miner.lock:
+        average = sum(miner.rate_samples) / len(miner.rate_samples) if miner.rate_samples else None
+        print(f"Mined for {duration(time.time() - miner.started)}: average {value(average, 'FW/s', 2)}, "
+              f"{miner.accepted} accepted, {miner.rejected} rejected, {miner.stale} stale, "
+              f"{miner.blocks} blocks.")
+        for _stamp, text, _color in list(miner.events)[-3:]:
+            print(f"  {text}")
+    if arguments.log:
+        print(f"Log: {arguments.log}")
+    code = child.returncode if child.returncode is not None else 1
+    return code if code >= 0 else 128 - code
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

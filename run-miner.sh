@@ -14,6 +14,7 @@ if [[ -x "${lab_dir}/cmfd-hip-runtime" && -x "${lab_dir}/cmfd-hip-discovery" ]];
   default_model_verifier="${lab_dir}/verify-model.sh"
   compatibility_tools="${prefix_dir}/libexec/common-foundry-amd-hip"
   default_scratch="${XDG_STATE_HOME:-${HOME}/.local/state}/common-foundry/amd-hip/scratch/mainnet-v1.0.13"
+  default_screen_logs="${XDG_STATE_HOME:-${HOME}/.local/state}/common-foundry/amd-hip/logs/miner"
 else
   default_package="${lab_dir}/../versions/v1.0.13/commonfoundry-mainnet-miner-linux-x86_64-v1.0.13"
   default_model="${lab_dir}/../versions/v1.0.13/runtime/commonfoundry-mainnet-runtime-linux-x86_64-v1.0.13/production-v4/MODEL-V2.bank"
@@ -24,6 +25,7 @@ else
   default_model_verifier="${lab_dir}/tools/verify-model.sh"
   compatibility_tools="${lab_dir}/tools"
   default_scratch="${lab_dir}/scratch/mainnet-v1.0.13"
+  default_screen_logs="${lab_dir}/logs/miner"
 fi
 package_dir="${CMFD_MINER_PACKAGE:-${default_package}}"
 miner_binary="${CMFD_MINER_BINARY:-${package_dir:+${package_dir}/cmfd-miner}}"
@@ -137,6 +139,18 @@ selected_selector="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["se
 [[ -n "${selected_selector}" ]] || fail 'HIP discovery returned no worker selector'
 export CMFD_HIP_DEVICE_SELECTOR="${selected_selector}"
 unset CMFD_HIP_DEVICE
+# The mining screen and telemetry follow the GPU the worker selected.
+mapfile -t selected_details < <(python3 -c '
+import json, sys
+document = json.load(sys.stdin)
+selector = document["selection"]["worker_selector"]
+device = next((d for d in document.get("devices", []) if d.get("worker_selector") == selector), {})
+for key in ("pci_bus_id", "name", "architecture"):
+    print(" ".join(str(device.get(key) or "").split()))
+' <<<"${discovery_json}" 2>/dev/null || true)
+export CMFD_HIP_TELEMETRY_PCI="${selected_details[0]:-}"
+export CMFD_HIP_GPU_NAME="${selected_details[1]:-}"
+export CMFD_HIP_GPU_ARCH="${selected_details[2]:-}"
 "${model_verifier}" "${model_bank}" 6442975416 "${expected_model_sha256}"
 "${tls_verifier}" "${pool_url}"
 "${worker_binary}" --self-test
@@ -153,11 +167,24 @@ scratch_dir="$(realpath -e -- "${scratch_dir}")"
 # compatibility probe; the selected worker remains the native HIP executable.
 export PATH="${compatibility_tools}:${PATH}"
 
-exec "${miner_binary}" pool \
+miner_command=("${miner_binary}" pool \
   --pool "${pool_url}" \
   --miner "${payout_address,,}" \
   --worker "${worker_name}" \
   --production-v4-bank "${model_bank}" \
   --production-v4-replay-worker "${worker_binary}" \
   --production-v4-scratch "${scratch_dir}" \
-  --stats-seconds "${CMFD_STATS_SECONDS:-5}"
+  --stats-seconds "${CMFD_STATS_SECONDS:-5}")
+
+# The mining screen runs the coordinator, keeps a log and caches AMD telemetry
+# for the compatibility probe.  CMFD_SCREEN=0 keeps plain output.
+screen="${compatibility_tools}/cmfd-amd-screen"
+if [[ -r "${screen}" ]]; then
+  export CMFD_HIP_TELEMETRY_CACHE="${scratch_dir}/telemetry.json"
+  screen_logs="${CMFD_SCREEN_LOG_DIR:-${default_screen_logs}}"
+  mkdir -p -- "${screen_logs}"
+  chmod 700 -- "${screen_logs}"
+  exec python3 -I "${screen}" --log "${screen_logs}/miner-$(date -u '+%Y%m%dT%H%M%SZ').log" \
+    -- "${miner_command[@]}"
+fi
+exec "${miner_command[@]}"

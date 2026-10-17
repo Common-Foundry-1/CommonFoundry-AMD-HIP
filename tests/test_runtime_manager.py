@@ -59,6 +59,7 @@ def manager_env(base: Path) -> dict[str, str]:
     env.pop("CMFD_HIP_RUNTIME_ROOT", None)
     env.pop("CMFD_HIP_RUNTIME_MANIFEST", None)
     env["CMFD_HIP_STATE_DIR"] = str(base / "state")
+    env["CMFD_HIP_DXG_DEVICE"] = str(base / "no-dxg")  # native Linux, even on a WSL host
     return env
 
 
@@ -397,6 +398,7 @@ def main() -> int:
             "CMFD_MINER_BINARY": str(fake_miner),
             "CMFD_MODEL_BANK": str(fake_model),
             "CMFD_SCRATCH_DIR": str(launcher_dir / "scratch"),
+            "CMFD_SCREEN_LOG_DIR": str(launcher_dir / "logs"),
             "CMFD_PAYOUT_ADDRESS": "a" * 64,
             "CMFD_POOL_URL": "cmfd+tls://127.0.0.1:1?pin=" + "b" * 64,
             "CMFD_HIP_DEVICE_SELECTOR": "pci:0000:0e:00.0",

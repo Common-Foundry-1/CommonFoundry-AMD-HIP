@@ -86,8 +86,9 @@ install(PROGRAMS
   runtime/cmfd-hip-runtime
   tools/verify-model.sh
   tools/verify-pool-tls.sh
+  tools/wsl-setup.sh
   DESTINATION bin)
-install(PROGRAMS tools/nvidia-smi
+install(PROGRAMS tools/nvidia-smi tools/cmfd-amd-screen tools/amd_gpu_telemetry.py
   DESTINATION libexec/common-foundry-amd-hip)
 install(FILES runtime/packages-v1.tsv
   DESTINATION share/common-foundry/amd-hip)
@@ -118,6 +119,9 @@ if(BUILD_TESTING)
               "${CMAKE_CURRENT_SOURCE_DIR}/runtime/cmfd-hip-runtime"
               "${CMAKE_CURRENT_SOURCE_DIR}/cmfd-v4-hip-worker"
               "${CMAKE_CURRENT_SOURCE_DIR}/run-miner.sh")
+    add_test(NAME amd-telemetry-and-screen
+      COMMAND "${Python3_EXECUTABLE}"
+              "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_amd_telemetry.py")
     add_test(NAME model-integrity-cache
       COMMAND "${Python3_EXECUTABLE}"
               "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_model_integrity_cache.py"

@@ -5,12 +5,44 @@ set -euo pipefail
 # coordinator insists on NVIDIA telemetry even when its replay worker is an
 # external executable.  It only consumes this CSV row to select/lock GPU 0;
 # actual execution and device selection remain in the HIP worker.
+#
+# The telemetry columns carry real AMD readings (power, temperature, fan,
+# load, clocks, VRAM) from amd_gpu_telemetry.py when available, so the
+# coordinator's MINER STATS power/efficiency/temp are real.  The UUID stays a
+# placeholder.  Readings come from the cache written by cmfd-amd-screen so the
+# mining loop never waits on a slow sensor query.
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+uuid='GPU-00000000-0000-0000-0000-000000000000'
+placeholder="0, ${uuid}, N/A, N/A, N/A, N/A, N/A, N/A, N/A, N/A, N/A"
+row_pattern='^0, GPU-0{8}-0{4}-0{4}-0{4}-0{12}(, ([0-9]+(\.[0-9]+)?|N/A)){9}$'
+
+telemetry_row() {
+  local cache=${CMFD_HIP_TELEMETRY_CACHE:-} row='' modified now
+  if [[ -n "${cache}" && -r "${cache}.csv" ]]; then
+    modified="$(stat -c %Y -- "${cache}.csv" 2>/dev/null || printf 0)"
+    now="$(date +%s)"
+    if (( now - modified <= 15 )) && IFS= read -r row <"${cache}.csv" && [[ "${row}" =~ ${row_pattern} ]]; then
+      printf '%s\n' "${row}"
+      return 0
+    fi
+  fi
+  if command -v python3 >/dev/null 2>&1 && [[ -r "${script_dir}/amd_gpu_telemetry.py" ]]; then
+    row="$(timeout 3 python3 -I "${script_dir}/amd_gpu_telemetry.py" --nvidia-csv 2>/dev/null || true)"
+    if [[ "${row}" =~ ${row_pattern} ]]; then
+      printf '%s\n' "${row}"
+      return 0
+    fi
+  fi
+  return 1
+}
+
 case " ${*} " in
   *" --query-gpu="*" --format=csv,noheader,nounits "*)
-    printf '%s\n' '0, GPU-00000000-0000-0000-0000-000000000000, 0, 0, 0, 0, 0, 0, 0, 0, 24564'
+    telemetry_row || printf '%s\n' "${placeholder}"
     ;;
   *" -L "*|*" --list-gpus "*)
-    printf '%s\n' 'GPU 0: AMD Radeon RX 7900 XTX (UUID: GPU-00000000-0000-0000-0000-000000000000)'
+    printf 'GPU 0: %s (UUID: %s)\n' "${CMFD_HIP_GPU_NAME:-AMD Radeon GPU}" "${uuid}"
     ;;
   *)
     printf 'AMD HIP compatibility shim: unsupported nvidia-smi arguments: %s\n' "$*" >&2

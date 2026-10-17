@@ -22,5 +22,9 @@ if [[ -n "${runtime_root}" && "${runtime_root}" == /* ]]; then
   runtime_paths="${runtime_root}/lib:${runtime_root}/lib/rocm_sysdeps/lib:${runtime_root}/lib/llvm/lib"
   export LD_LIBRARY_PATH="${runtime_paths}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 fi
+# WSL2: let ROCm reach the GPU through AMD's librocdxg bridge.
+if [[ -e /dev/dxg && ! -e /dev/kfd ]]; then
+  export HSA_ENABLE_DXG_DETECTION=1
+fi
 
 exec "${native}" "$@"
